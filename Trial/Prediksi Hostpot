@@ -85,3 +85,34 @@ def hari_kering_berturut(s, ambang=1.0):
 
 met["HKB"] = g["PRECTOTCORR"].transform(hari_kering_berturut)  # hari kering berturut-turut
 
+hs = df_hotspot.copy()
+hs["acq_date"] = pd.to_datetime(hs["acq_date"])
+print("Jumlah awal:", len(hs))
+
+# buang deteksi confidence rendah ('l'); hapus baris ini kalau mau semua dipakai
+hs = hs[hs["confidence"].isin(["n", "h"])]
+hs = hs.rename(columns={"acq_date": "tanggal"})
+hs = hs[["tanggal", "latitude", "longitude"]].dropna().reset_index(drop=True)
+print("Setelah filter confidence:", len(hs))
+
+# ---- potong ke batas provinsi ----
+batas = batas.to_crs("EPSG:4326")
+try:
+    batas_union = batas.geometry.union_all()      # geopandas >= 1.0
+except AttributeError:
+    batas_union = batas.geometry.unary_union      # geopandas lama
+
+gdf_hs = gpd.GeoDataFrame(
+    hs.copy(),
+    geometry=gpd.points_from_xy(hs["longitude"], hs["latitude"]),
+    crs="EPSG:4326",
+)
+dalam = gdf_hs.geometry.intersects(batas_union)
+print("Hotspot dalam provinsi :", dalam.sum())
+print("Hotspot di luar        :", (~dalam).sum())
+
+hs = gdf_hs.loc[dalam].drop(columns="geometry").reset_index(drop=True)
+
+# ---- cek posisi stasiun terhadap batas provinsi ----
+for nm, (la, lo) in STASIUN.items():
+    print(f"{nm:15s} di dalam provinsi: {batas_union.contains(Point(lo, la))}")
