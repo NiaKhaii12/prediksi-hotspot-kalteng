@@ -266,3 +266,493 @@ ax.scatter(b["longitude"], b["latitude"], s=0.3, alpha=0.3, c="tab:blue", label=
 ax.legend(markerscale=15)
 plt.savefig(f"{SAVE_DIR}/peta_cakupan_test.png", dpi=200, bbox_inches="tight")
 plt.show()
+
+FITUR_MET = VAR + ["CH_3d", "CH_7d", "CH_14d", "CH_30d", "CH_60d",
+                   "RH_7d", "T_7d", "HKB", "HKB5", "VPD", "VPD_7d"]
+
+def bangun_panel_v2(h, zi, jarak_st, met2, r_tetangga=30.0, p_idw=2.0):
+    dates = pd.date_range(met2["tanggal"].min(), met2["tanggal"].max())
+    zones = zi.index.values
+    D, Z = len(dates), len(zones)
+    feats = {}
+
+    def bcast(v):       # vektor per tanggal -> matriks D x Z
+        return pd.DataFrame(np.repeat(np.asarray(v)[:, None], Z, axis=1), index=dates, columns=zones)
+
+    # --- riwayat hotspot per zona
+    cnt = (h[h["zona"] >= 0].groupby(["tanggal", "zona"]).size()
+           .unstack(fill_value=0).reindex(index=dates, columns=zones, fill_value=0))
+    Hb = (cnt > 0).astype(float)
+    feats["hs_hari_ini"] = Hb
+    feats["n_hs_log"] = np.log1p(cnt)
+    for w in (3, 7, 14, 30):
+        feats[f"hs_{w}d"] = Hb.rolling(w, min_periods=1).sum()
+    idx = np.arange(D)[:, None]
+    last = pd.DataFrame(np.where(Hb.values > 0, idx, np.nan), index=dates, columns=zones).ffill()
+    feats["hari_sejak_hs"] = pd.DataFrame(idx - last.values, index=dates, columns=zones).fillna(90).clip(upper=90)
+
+    # --- tetangga (radius r_tetangga km) dan aktivitas provinsi
+    dz = haversine_distances(np.radians(zi[["lat", "lon"]].values)) * 6371
+    A = ((dz <= r_tetangga) & (dz > 0)).astype(float)
+    nb = pd.DataFrame((Hb.values @ A.T) / np.maximum(A.sum(axis=1), 1.0), index=dates, columns=zones)
+    feats["nb_hari_ini"] = nb
+    feats["nb_7d"] = nb.rolling(7, min_periods=1).mean()
+    prov = Hb.mean(axis=1)
+    feats["prov_aktif"] = bcast(prov.values)
+    feats["prov_aktif_7d"] = bcast(prov.rolling(7, min_periods=1).mean().values)
+
+    # --- cuaca: IDW dari stasiun ke titik pusat zona
+    nama_st = list(STASIUN)
+    Wt = 1.0 / np.maximum(jarak_st, 1.0) ** p_idw
+    Wt = Wt / Wt.sum(axis=1, keepdims=True)                      # zona x stasiun
+    for f in FITUR_MET:
+        M = (met2.pivot(index="tanggal", columns="lokasi", values=f)
+                  .reindex(index=dates, columns=nama_st).interpolate(limit_direction="both"))
+        feats[f] = pd.DataFrame(M.values @ Wt.T, index=dates, columns=zones)
+
+    # --- musim
+    doy = dates.dayofyear.values
+    feats["musim_sin"] = bcast(np.sin(2 * np.pi * doy / 365.25))
+    feats["musim_cos"] = bcast(np.cos(2 * np.pi * doy / 365.25))
+
+    # --- rakit (urutan: per tanggal, lalu per zona)
+    data = {"tanggal": np.repeat(dates.values, Z), "zona": np.tile(zones, D),
+            "target": Hb.shift(-1).values.ravel()}
+    for k, v in feats.items():
+        data[k] = v.values.ravel()
+    for k in ("lat", "lon", "jarak_stasiun_km"):
+        data[k] = np.tile(zi[k].values, D)
+    pn = pd.DataFrame(data).dropna(subset=["target"])
+    pn["target"] = pn["target"].astype(int)
+    return pn.reset_index(drop=True)
+
+pn = bangun_panel_v2(h, zi, JARAK_ST, met2)
+print(pn.shape, "| positif: %.2f%%" % (100 * pn["target"].mean()))
+
+# ---------- kelompok fitur ----------
+F_A = VAR + ["CH_3d", "CH_7d", "CH_14d", "RH_7d", "T_7d", "HKB"] + \
+      ["lat", "lon", "jarak_stasiun_km", "hs_hari_ini", "hs_7d"]
+F_CUACA = ["CH_30d", "CH_60d", "HKB5", "VPD", "VPD_7d"]
+F_HS    = ["n_hs_log", "hs_3d", "hs_14d", "hs_30d", "hari_sejak_hs"]
+F_NB    = ["nb_hari_ini", "nb_7d", "prov_aktif", "prov_aktif_7d"]
+F_MUSIM = ["musim_sin", "musim_cos"]
+FITUR_ALL = F_A + F_CUACA + F_HS + F_NB + F_MUSIM
+
+# ---------- split: 2024-12-31 dibuang dari train (targetnya jatuh di 2025) ----------
+T0 = pd.Timestamp(BATAS_TRAIN)
+tr_full = pn[pn["tanggal"] < T0].reset_index(drop=True)
+te      = pn[pn["tanggal"] > T0].reset_index(drop=True)
+X_full, y_full = tr_full[FITUR_ALL], tr_full["target"]
+
+# CV per tahun: fold 1 validasi 2023 (tahun api), fold 2 validasi 2024
+yr = tr_full["tanggal"].dt.year.values
+folds = [(np.where(yr <= 2022)[0], np.where(yr == 2023)[0]),
+         (np.where(yr <= 2023)[0], np.where(yr == 2024)[0])]
+def cv_tahun(cols):
+    skor = []
+    for tr, va in folds:
+        rf, xgb = latih(X_full.iloc[tr][cols], y_full.iloc[tr], "tanpa")
+        p = proba_ens(rf, xgb, X_full.iloc[va][cols])
+        skor.append(average_precision_score(y_full.iloc[va], p))
+    return skor
+
+GRUP = {"A. setara fitur lama":              F_A,
+        "B. + cuaca baru (VPD, hujan 30/60d)": F_A + F_CUACA,
+        "C. + riwayat hotspot kaya":         F_A + F_CUACA + F_HS,
+        "D. + tetangga dan provinsi":        F_A + F_CUACA + F_HS + F_NB,
+        "E. + musim":                        FITUR_ALL}
+
+def jalankan_ablasi():
+    rows = []
+    for nm, cols in GRUP.items():
+        s = cv_tahun(cols)
+        rows.append({"Kelompok": nm, "PR-AUC val 2023": s[0], "PR-AUC val 2024": s[1],
+                     "Rata-rata": np.mean(s)})
+    return pd.DataFrame(rows).set_index("Kelompok")
+
+abl = cached("ablasi_fitur_v2", jalankan_ablasi)
+print(abl.round(4))
+
+rf_param2 = {"n_estimators": randint(150, 400), "max_depth": randint(3, 16),
+             "min_samples_split": randint(2, 30), "min_samples_leaf": randint(1, 20),
+             "max_features": ["sqrt", 0.3, 0.5], "max_samples": [0.3, 0.5, 0.8]}
+xgb_param2 = {"n_estimators": randint(100, 500), "max_depth": randint(2, 8),
+              "learning_rate": loguniform(0.005, 0.1), "subsample": uniform(0.6, 0.4),
+              "colsample_bytree": uniform(0.5, 0.5), "min_child_weight": randint(1, 20),
+              "gamma": uniform(0, 1), "reg_lambda": loguniform(0.5, 20)}
+
+def jalankan_tuning():
+    rf_s = RandomizedSearchCV(RandomForestClassifier(random_state=RS, n_jobs=1),
+                              rf_param2, n_iter=15, cv=folds, scoring="average_precision",
+                              random_state=RS, n_jobs=-1, verbose=1)
+    rf_s.fit(X_full[FITUR_PAKAI], y_full)
+    xgb_s = RandomizedSearchCV(XGBClassifier(objective="binary:logistic", eval_metric="logloss",
+                                             tree_method="hist", random_state=RS, n_jobs=1),
+                               xgb_param2, n_iter=15, cv=folds, scoring="average_precision",
+                               random_state=RS, n_jobs=-1, verbose=1)
+    xgb_s.fit(X_full[FITUR_PAKAI], y_full)
+    return {"RF_PARAMS": rf_s.best_params_, "XGB_PARAMS": xgb_s.best_params_,
+            "rf_skor": rf_s.best_score_, "xgb_skor": xgb_s.best_score_}
+
+PARAM_V2 = {'RF_PARAMS': {'max_depth': 9, 'max_features': 'sqrt', 'max_samples': 0.8, 'min_samples_leaf': 5, 'min_samples_split': 20, 'n_estimators': 284}, 'XGB_PARAMS': {'colsample_bytree': 0.569746930326021, 'gamma': 0.29214464853521815, 'learning_rate': 0.014983654548550792, 'max_depth': 7, 'min_child_weight': 15, 'n_estimators': 150, 'reg_lambda': 2.0497318936355757, 'subsample': 0.9932923543227152}}
+
+if PARAM_V2 is not None:
+    tun2 = PARAM_V2                                  # cepat, tanpa tuning
+else:
+    tun2 = cached("tuning_v2", jalankan_tuning)      # tuning (di-cache)
+
+RF_PARAMS, XGB_PARAMS = tun2["RF_PARAMS"], tun2["XGB_PARAMS"]
+
+def bersih(d):
+    return {k: (float(v) if isinstance(v, (float, np.floating)) else
+                int(v) if isinstance(v, (int, np.integer)) else v) for k, v in d.items()}
+print("PARAM_V2 =", {"RF_PARAMS": bersih(RF_PARAMS), "XGB_PARAMS": bersih(XGB_PARAMS)})
+
+# ================= TAHAP 9: Penanganan imbalance (tanpa SMOTE) =================
+# [UNDERSAMPLING]: Ini adalah definisi kelas untuk skenario Undersampling.
+# Menggunakan teknik UnderBagging (membuat K model dari sampel kelas negatif yang di-downsample).
+class UnderBagging:
+    """K model, masing-masing dilatih pada subset negatif acak; probabilitas dirata-rakakan."""
+    def __init__(self, buat_model, K=10, rasio=1.0, seed=RS):
+        self.buat_model, self.K, self.rasio, self.seed = buat_model, K, rasio, seed
+    def fit(self, X, y):
+        rng = np.random.default_rng(self.seed)
+        yv = np.asarray(y)
+        pos, neg = np.where(yv == 1)[0], np.where(yv == 0)[0]
+        n_neg = min(len(neg), int(len(pos) * self.rasio))
+        self.models_ = []
+        for k in range(self.K):
+            idx = np.concatenate([pos, rng.choice(neg, n_neg, replace=False)])
+            self.models_.append(self.buat_model(k).fit(X.iloc[idx], yv[idx]))
+        return self
+    def predict_proba(self, X):
+        p = np.mean([m.predict_proba(X)[:, 1] for m in self.models_], axis=0)
+        return np.column_stack([1 - p, p])
+    @property
+    def feature_importances_(self):
+        return np.mean([m.feature_importances_ for m in self.models_], axis=0)
+
+K_UNDER = 10
+
+# [BOBOT CLASS WEIGHT / TANPA]: Fungsi pembantu untuk membuat model Random Forest.
+# Parameter 'cw' akan diisi jika menggunakan class_weight, dan bernilai None jika 'tanpa'.
+def buat_rf(seed=RS, cw=None, n_est=None):
+    p = dict(RF_PARAMS)
+    if n_est: p["n_estimators"] = n_est
+    return RandomForestClassifier(**p, class_weight=cw, random_state=seed, n_jobs=-1)
+
+# [BOBOT CLASS WEIGHT / TANPA]: Fungsi pembantu untuk membuat model XGBoost.
+# Parameter 'spw' (scale_pos_weight) akan diisi jika menggunakan class_weight, dan bernilai 1.0 jika 'tanpa'.
+def buat_xgb(seed=RS, spw=1.0):
+    return XGBClassifier(**XGB_PARAMS, objective="binary:logistic", eval_metric="logloss",
+                         scale_pos_weight=spw, tree_method="hist", random_state=seed, n_jobs=-1)
+
+# PENGATURAN SKENARIO UTAMA
+def latih(X, y, skenario="tanpa"):
+    # -------------------------------------------------------------------------
+    # 1. SKENARIO "TANPA" (Baseline / Tanpa Penanganan Imbalance)
+    # Model berjalan apa adanya menggunakan hyperparameter standar hasil tuning.
+    # -------------------------------------------------------------------------
+    if skenario == "tanpa":
+        return buat_rf().fit(X, y), buat_xgb().fit(X, y)
+
+    # -------------------------------------------------------------------------
+    # 2. SKENARIO "CLASS_WEIGHT" (Penanganan Menggunakan Bobot Kelas)
+    # RF menggunakan penyeimbang internal "balanced_subsample".
+    # XGB menggunakan rumus rasio jumlah kelas negatif dibagi kelas positif (spw).
+    # -------------------------------------------------------------------------
+    if skenario == "class_weight":
+        spw = (y == 0).sum() / (y == 1).sum()
+        return buat_rf(cw="balanced_subsample").fit(X, y), buat_xgb(spw=spw).fit(X, y)
+
+    # -------------------------------------------------------------------------
+    # 3. SKENARIO "UNDERSAMPLING" (Penanganan Menggunakan Undersampling)
+    # Model dilatih menggunakan kelas UnderBagging yang didefinisikan di atas.
+    # -------------------------------------------------------------------------
+    if skenario == "undersampling":
+        n_rf = max(50, RF_PARAMS["n_estimators"] // K_UNDER)
+        rf = UnderBagging(lambda k: buat_rf(RS + k, n_est=n_rf), K=K_UNDER).fit(X, y)
+        xgb = UnderBagging(lambda k: buat_xgb(RS + k), K=K_UNDER).fit(X, y)
+        return rf, xgb
+
+# Ketiga skenario di atas dimasukkan ke dalam list untuk diuji secara bergantian (Looping)
+SKENARIO = ["tanpa", "class_weight", "undersampling"]
+MODEL = ["RF", "XGB", "Soft Voting"]
+
+def jalankan_imbalance():
+    Xte_, yte_ = te[F], te["target"]
+    cv_rows, test_rows = [], []
+    for sk in SKENARIO:
+        oof_p = {m: [] for m in MODEL}; oof_y = []; skor = {m: [] for m in MODEL}
+        for tr, va in folds:
+            rf, xgb = latih(X_full.iloc[tr][F], y_full.iloc[tr], sk)
+            Xv_, yv_ = X_full.iloc[va][F], y_full.iloc[va]
+            ps = {"RF": rf.predict_proba(Xv_)[:, 1], "XGB": xgb.predict_proba(Xv_)[:, 1],
+                  "Soft Voting": proba_ens(rf, xgb, Xv_)}
+            for m in MODEL:
+                oof_p[m].append(ps[m]); skor[m].append(average_precision_score(yv_, ps[m]))
+            oof_y.append(yv_.values)
+        oof_y = np.concatenate(oof_y)
+        thr = {m: thr_optimal(oof_y, np.concatenate(oof_p[m])) for m in MODEL}
+        for m in MODEL:
+            cv_rows.append({"Skenario": sk, "Model": m, "PR-AUC val 2023": skor[m][0],
+                            "PR-AUC val 2024": skor[m][1], "Rata-rata": np.mean(skor[m])})
+        # laporan test (HANYA pelaporan, tidak dipakai untuk memilih)
+        rf, xgb = latih(X_full[F], y_full, sk)
+        pt = {"RF": rf.predict_proba(Xte_)[:, 1], "XGB": xgb.predict_proba(Xte_)[:, 1],
+              "Soft Voting": proba_ens(rf, xgb, Xte_)}
+        for m in MODEL:
+            test_rows.append(evaluasi(m, yte_, pt[m], thr=thr[m], Skenario=sk, Threshold=round(thr[m], 3)))
+    return {"cv": pd.DataFrame(cv_rows).set_index(["Skenario", "Model"]),
+            "test": pd.DataFrame(test_rows).set_index(["Skenario", "Model"])}
+
+imb = cached("imbalance_v2", jalankan_imbalance)
+print("Seleksi (CV per tahun, PR-AUC):"); print(imb["cv"].round(4))
+print("\nLaporan di test (threshold dari OOF tiap skenario):"); print(imb["test"].round(4))
+
+# aturan seleksi (ditetapkan sebelum melihat hasil): skenario dengan PR-AUC CV tertinggi pada
+# Soft Voting, kecuali selisihnya dari 'tanpa' < 0.01 -> pilih yang paling sederhana ('tanpa')
+sv = imb["cv"].xs("Soft Voting", level="Model")["Rata-rata"]
+SK_TERBAIK = sv.idxmax()
+if sv.max() - sv["tanpa"] < 0.01:
+    SK_TERBAIK = "tanpa"
+print("\nSkenario terpilih:", SK_TERBAIK)
+
+# ================= Tahap 10 : threshold OOF, model final, tabel perbandingan =================
+F = FITUR_PAKAI
+Xt, yt = te[F], te["target"]
+p_pers = te["hs_hari_ini"].values               # persistence: besok = hari ini
+
+# ---------- 1) threshold dari prediksi out-of-fold (validasi 2023 + 2024) ----------
+oof_p = {m: [] for m in MODEL}; oof_y = []
+for tr, va in folds:
+    rf, xgb = latih(X_full.iloc[tr][F], y_full.iloc[tr], SK_TERBAIK)
+    Xv_ = X_full.iloc[va][F]
+    oof_p["RF"].append(rf.predict_proba(Xv_)[:, 1])
+    oof_p["XGB"].append(xgb.predict_proba(Xv_)[:, 1])
+    oof_p["Soft Voting"].append(proba_ens(rf, xgb, Xv_))
+    oof_y.append(y_full.iloc[va].values)
+oof_y = np.concatenate(oof_y)
+THR = {m: thr_optimal(oof_y, np.concatenate(oof_p[m])) for m in MODEL}
+print("Threshold (OOF):", {k: round(v, 3) for k, v in THR.items()})
+
+# ---------- 2) model final: latih pada seluruh train, prediksi test ----------
+rf_f, xgb_f = latih(X_full[F], y_full, SK_TERBAIK)
+P = {"RF": rf_f.predict_proba(Xt)[:, 1], "XGB": xgb_f.predict_proba(Xt)[:, 1]}
+P["Soft Voting"] = proba_ens(rf_f, xgb_f, Xt)
+
+# ---------- 3) baseline: parameter default, tanpa tuning, fitur yang sama ----------
+rf0 = RandomForestClassifier(random_state=RS, n_jobs=-1).fit(X_full[F], y_full)
+xgb0 = XGBClassifier(objective="binary:logistic", eval_metric="logloss",
+                     tree_method="hist", random_state=RS, n_jobs=-1).fit(X_full[F], y_full)
+p0 = {"RF": rf0.predict_proba(Xt)[:, 1], "XGB": xgb0.predict_proba(Xt)[:, 1]}
+p0["Soft Voting"] = 0.5 * p0["RF"] + 0.5 * p0["XGB"]
+
+# ---------- 4) Tabel A: tangga baseline -> tuned (threshold 0.5, apple to apple) ----------
+tabelA = pd.DataFrame(
+    [evaluasi("Persistence", yt, p_pers)] +
+    [evaluasi(f"{m} baseline", yt, p0[m]) for m in MODEL] +
+    [evaluasi(f"{m} tuned", yt, P[m]) for m in MODEL]
+).set_index("Model").round(4)
+print("\nTabel A: threshold 0.5 (baseline -> tuned)")
+print(tabelA)
+
+# ---------- 5) Tabel B: model final dengan threshold dari validasi ----------
+tabelB = pd.DataFrame(
+    [evaluasi("Persistence", yt, p_pers)] +
+    [evaluasi(f"{m} final", yt, P[m], thr=THR[m], Threshold=round(THR[m], 3)) for m in MODEL]
+).set_index("Model").round(4)
+print("\nTabel B: model final (threshold dari OOF)")
+print(tabelB)
+
+f1_pers = f1_score(yt, p_pers, zero_division=0)
+for m in MODEL:
+    f1_m = tabelB.loc[f"{m} final", "F1-score"]
+    print(f"Selisih F1 {m} vs persistence: {f1_m - f1_pers:+.4f}")
+
+# ---------- 6) performa per tahun (model final Soft Voting vs persistence) ----------
+d = te[["tanggal", "target"]].copy()
+d["p"] = P["Soft Voting"]; d["pers"] = p_pers
+rows = []
+for th, g in d.groupby(d["tanggal"].dt.year):
+    pr_ = (g["p"] >= THR["Soft Voting"]).astype(int)
+    f1_m = f1_score(g["target"], pr_, zero_division=0)
+    f1_p = f1_score(g["target"], g["pers"], zero_division=0)
+    rows.append({"Tahun": th, "n_positif": int(g["target"].sum()), "rasio_positif": g["target"].mean(),
+                 "PR-AUC": average_precision_score(g["target"], g["p"]),
+                 "Precision": precision_score(g["target"], pr_, zero_division=0),
+                 "Recall": recall_score(g["target"], pr_, zero_division=0),
+                 "F1": f1_m, "F1 persistence": f1_p, "Selisih F1": f1_m - f1_p})
+tabelC = pd.DataFrame(rows).set_index("Tahun").round(4)
+print("\nTabel C: per tahun")
+print(tabelC)
+
+# ---------- 7) grafik: ROC, Precision-Recall, confusion matrix ----------
+kurva = {"RF baseline": p0["RF"], "XGB baseline": p0["XGB"], "Soft Voting baseline": p0["Soft Voting"],
+         "RF tuned": P["RF"], "XGB tuned": P["XGB"], "Soft Voting tuned": P["Soft Voting"]}
+fig, ax = plt.subplots(1, 2, figsize=(13, 5))
+for nm, p in kurva.items():
+    fpr, tpr, _ = roc_curve(yt, p)
+    ax[0].plot(fpr, tpr, label=f"{nm} ({roc_auc_score(yt, p):.3f})")
+    pr, rc, _ = precision_recall_curve(yt, p)
+    ax[1].plot(rc, pr, label=f"{nm} ({average_precision_score(yt, p):.3f})")
+ax[0].plot([0, 1], [0, 1], "k--"); ax[0].set_title("Kurva ROC"); ax[0].legend(fontsize=8)
+ax[1].set_title("Kurva Precision-Recall"); ax[1].set_xlabel("Recall"); ax[1].set_ylabel("Precision")
+ax[1].legend(fontsize=8)
+plt.tight_layout(); plt.savefig(f"{SAVE_DIR}/kurva_roc_pr.png", dpi=200); plt.show()
+
+# confusion matrix semua model final (threshold dari OOF) + persistence
+cm_model = {f"{m} final": (P[m] >= THR[m]).astype(int) for m in MODEL}
+cm_model["Persistence"] = p_pers.astype(int)
+
+fig, ax = plt.subplots(1, len(cm_model), figsize=(4.5 * len(cm_model), 4.5))
+for a, (nm, pred) in zip(ax, cm_model.items()):
+    ConfusionMatrixDisplay(confusion_matrix(yt, pred),
+                           display_labels=["Tidak", "Hotspot"]).plot(ax=a, colorbar=False, values_format="d")
+    judul = f"{nm}\nthr={THR[nm.replace(' final', '')]:.3f}" if nm != "Persistence" else nm
+    a.set_title(f"{judul}\nF1={f1_score(yt, pred, zero_division=0):.4f}")
+plt.tight_layout()
+plt.savefig(f"{SAVE_DIR}/confusion_matrix_semua.png", dpi=200); plt.show()
+
+# simpan juga per model (untuk slide satu-satu)
+for nm, pred in cm_model.items():
+    ConfusionMatrixDisplay(confusion_matrix(yt, pred),
+                           display_labels=["Tidak", "Hotspot"]).plot(colorbar=False, values_format="d")
+    plt.title(f"Confusion matrix {nm}")
+    plt.savefig(f"{SAVE_DIR}/confusion_matrix_{nm.replace(' ', '_')}.png", dpi=200, bbox_inches="tight")
+    plt.close()
+
+# ---------- 8) simpan tabel untuk laporan ----------
+tabelA.to_csv(f"{SAVE_DIR}/tabel_A_baseline_tuned.csv")
+tabelB.to_csv(f"{SAVE_DIR}/tabel_B_final.csv")
+tabelC.to_csv(f"{SAVE_DIR}/tabel_C_per_tahun.csv")
+
+# ================= WALK-FORWARD =================
+def metrik_blok(y, p, thr):
+    if y.nunique() < 2:
+        return dict(PR_AUC=np.nan, F1=np.nan, Recall=np.nan, Precision=np.nan)
+    pred = (p >= thr).astype(int)
+    return dict(PR_AUC=average_precision_score(y, p),
+                F1=f1_score(y, pred, zero_division=0),
+                Recall=recall_score(y, pred, zero_division=0),
+                Precision=precision_score(y, pred, zero_division=0))
+
+pn["kuartal"] = pn["tanggal"].dt.to_period("Q")
+kuartal_uji = sorted(pn.loc[pn["tanggal"] > T0, "kuartal"].unique())
+THR_SV = THR["Soft Voting"]
+
+def jalankan_wf():
+    rows = []
+    for q in kuartal_uji:
+        # buang 1 hari terakhir sebelum kuartal uji (targetnya jatuh di kuartal uji)
+        tr_q = pn[pn["tanggal"] < q.start_time - pd.Timedelta(days=1)]
+        te_q = pn[pn["kuartal"] == q]
+        yq = te_q["target"]
+
+        rf_q, xgb_q = latih(tr_q[F].reset_index(drop=True),
+                            tr_q["target"].reset_index(drop=True), SK_TERBAIK)
+        p_wf = proba_ens(rf_q, xgb_q, te_q[F])         # dilatih ulang dengan data bertambah
+        p_st = proba_ens(rf_f, xgb_f, te_q[F])         # model statis (dilatih sekali, <= 2024)
+        f1_pers = (f1_score(yq, te_q["hs_hari_ini"], zero_division=0)
+                   if yq.nunique() > 1 else np.nan)
+
+        for mode, p, n in [("Walk-forward", p_wf, len(tr_q)), ("Statis", p_st, len(X_full))]:
+            rows.append({"Kuartal": str(q), "Mode": mode, "n_train": n,
+                         "n_positif": int(yq.sum()), "F1 persistence": f1_pers,
+                         **metrik_blok(yq, p, THR_SV)})
+    return pd.DataFrame(rows)
+
+wf = cached("walkforward_v2", jalankan_wf)
+print(wf.round(4))
+
+# ringkasan selisih walk-forward vs statis
+rg = wf.pivot(index="Kuartal", columns="Mode", values=["PR_AUC", "F1"])
+sel = pd.DataFrame({
+    "n_positif": wf[wf["Mode"] == "Statis"].set_index("Kuartal")["n_positif"],
+    "Selisih PR-AUC (WF - statis)": rg[("PR_AUC", "Walk-forward")] - rg[("PR_AUC", "Statis")],
+    "Selisih F1 (WF - statis)": rg[("F1", "Walk-forward")] - rg[("F1", "Statis")]})
+print("\nSelisih walk-forward vs statis:")
+print(sel.round(4))
+
+# grafik
+fig, ax = plt.subplots(1, 2, figsize=(13, 4.5))
+for mode, d in wf.groupby("Mode"):
+    ax[0].plot(d["Kuartal"], d["PR_AUC"], marker="o", label=mode)
+    ax[1].plot(d["Kuartal"], d["F1"], marker="o", label=mode)
+dp = wf[wf["Mode"] == "Statis"]
+ax[1].plot(dp["Kuartal"], dp["F1 persistence"], "k--", marker="x", label="Persistence")
+ax[0].set_title("PR-AUC per kuartal"); ax[1].set_title("F1 per kuartal")
+for a in ax:
+    a.legend(); a.tick_params(axis="x", rotation=45)
+plt.tight_layout(); plt.savefig(f"{SAVE_DIR}/walkforward_v2.png", dpi=200); plt.show()
+
+# ================= ANALISIS GALAT v2 =================
+from scipy.stats import spearmanr
+
+thr_f = THR["Soft Voting"]
+err = te[["zona", "tanggal", "target", "hs_hari_ini", "hs_7d"]].copy()
+err["p"] = P["Soft Voting"]
+err["pred"] = (err["p"] >= thr_f).astype(int)
+err["bulan"] = err["tanggal"].dt.to_period("M")
+
+def ringkas(d):
+    return pd.Series({
+        "n_positif": d["target"].sum(), "n_alarm": d["pred"].sum(),
+        "precision": precision_score(d["target"], d["pred"], zero_division=0),
+        "recall": recall_score(d["target"], d["pred"], zero_division=0),
+        "F1": f1_score(d["target"], d["pred"], zero_division=0),
+        "FP": ((d["pred"] == 1) & (d["target"] == 0)).sum(),
+        "FN": ((d["pred"] == 0) & (d["target"] == 1)).sum()})
+
+# ---------- 1) feature importance ----------
+fig, ax = plt.subplots(1, 2, figsize=(14, 9))
+pd.Series(rf_f.feature_importances_, index=F).sort_values().plot.barh(ax=ax[0]); ax[0].set_title("Importance RF")
+pd.Series(xgb_f.feature_importances_, index=F).sort_values().plot.barh(ax=ax[1]); ax[1].set_title("Importance XGB")
+plt.tight_layout(); plt.savefig(f"{SAVE_DIR}/feature_importance.png", dpi=200); plt.show()
+
+# ---------- 2) galat per bulan ----------
+pb = err.groupby("bulan").apply(ringkas, include_groups=False)
+print("Per bulan:"); print(pb.round(3))
+pb[["FP", "FN"]].plot.bar(figsize=(12, 4), width=0.8)
+plt.title("Alarm palsu (FP) dan kejadian terlewat (FN) per bulan")
+plt.tight_layout(); plt.savefig(f"{SAVE_DIR}/galat_per_bulan.png", dpi=200); plt.show()
+
+# ---------- 3) jenis galat: menguji penyebab FP dan FN ----------
+fp = err[(err["pred"] == 1) & (err["target"] == 0)]
+fn = err[(err["pred"] == 0) & (err["target"] == 1)]
+print("\nAlarm palsu (FP) total:", len(fp))
+print("  ada hotspot di zona itu dalam 7 hari terakhir : %.1f%%" % (100 * (fp["hs_7d"] > 0).mean()))
+print("  ada hotspot di zona itu pada hari alarm       : %.1f%%" % (100 * (fp["hs_hari_ini"] == 1).mean()))
+print("Kejadian terlewat (FN) total:", len(fn))
+print("  tanpa hotspot 7 hari terakhir (awal api baru) : %.1f%%" % (100 * (fn["hs_7d"] == 0).mean()))
+print("  dengan hotspot 7 hari terakhir (kelanjutan)   : %.1f%%" % (100 * (fn["hs_7d"] > 0).mean()))
+
+# ---------- 4) trade-off threshold ----------
+rows = []
+for t in sorted(set([0.1, 0.15, 0.2, round(thr_f, 3), 0.3, 0.4, 0.5, 0.6, 0.7])):
+    pr_ = (err["p"] >= t).astype(int)
+    tp = int(((pr_ == 1) & (err["target"] == 1)).sum())
+    rows.append({"threshold": t, "precision": precision_score(err["target"], pr_, zero_division=0),
+                 "recall": recall_score(err["target"], pr_, zero_division=0),
+                 "F1": f1_score(err["target"], pr_, zero_division=0),
+                 "n_alarm": int(pr_.sum()), "alarm per kejadian tertangkap": pr_.sum() / max(tp, 1)})
+print("\nTrade-off threshold (test):"); print(pd.DataFrame(rows).set_index("threshold").round(3))
+
+# ---------- 5) galat per zona dan pengaruh jarak ke stasiun ----------
+ez = err.groupby("zona").apply(ringkas, include_groups=False).join(zi[["jarak_stasiun_km"]])
+print("\n10 zona dengan FN terbanyak:")
+print(ez.sort_values("FN", ascending=False).head(10).round(3))
+print("\n10 zona dengan FP terbanyak:")
+print(ez.sort_values("FP", ascending=False).head(10).round(3))
+
+ok = ez[ez["n_positif"] >= 20]
+r, pv = spearmanr(ok["jarak_stasiun_km"], ok["F1"])
+print(f"\nKorelasi Spearman jarak-stasiun vs F1 (n={len(ok)} zona): r={r:.2f}, p={pv:.3f}")
+plt.scatter(ok["jarak_stasiun_km"], ok["F1"])
+plt.xlabel("Jarak zona ke stasiun terdekat (km)"); plt.ylabel("F1 per zona")
+plt.title("Pengaruh jarak ke stasiun terhadap performa")
+plt.savefig(f"{SAVE_DIR}/jarak_stasiun_vs_f1.png", dpi=200); plt.show()
+
+
+
+
