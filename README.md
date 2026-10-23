@@ -73,7 +73,7 @@ Nilai hilang NASA POWER (kode `-999`, 15 nilai per variabel) diisi dengan interp
 - Data meteorologi berasal dari produk grid NASA POWER, bukan observasi stasiun. Resolusinya jauh lebih kasar daripada ukuran zona.
 - Proporsi kelas positif berbeda tajam antartahun uji: 3,0% pada 2025 dan 21,0% pada 2026. Metrik uji gabungan karena itu banyak dipengaruhi 2026, padahal data tahun tersebut belum lengkap. Lihat evaluasi per tahun.
 
-## Struktur Notebook (`Emel.ipynb`)
+## Struktur Notebook (`main.ipynb`)
 
 | Tahap | Isi |
 |---|---|
