@@ -1,1 +1,56 @@
+import os, joblib
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import hdbscan
+from shapely.geometry import Point
+from scipy.stats import randint, uniform, loguniform
+from sklearn.neighbors import BallTree
+from sklearn.metrics.pairwise import haversine_distances
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
+                             roc_auc_score, average_precision_score, precision_recall_curve,
+                             confusion_matrix, roc_curve, ConfusionMatrixDisplay)
+from xgboost import XGBClassifier
 
+# ---------------- konfigurasi ----------------
+BATAS_TRAIN = "2024-12-31"
+RS = 42
+STASIUN = {                      # verifikasi koordinat ini dengan data NASA POWER
+    "Palangka Raya": (-2.21, 113.92),
+    "Sampit":        (-2.53, 112.95),
+    "Pangkalan Bun": (-2.68, 111.62),
+    "Muara Teweh":   (-0.95, 114.89),
+    "Kuala Kapuas":  (-3.00, 114.39),
+}
+VAR = ["T2M", "RH2M", "PRECTOTCORR", "WS10M"]
+
+# ---------------- cache ----------------
+PAKAI_DRIVE = True      # False kalau tidak mau menyentuh Google Drive
+if PAKAI_DRIVE:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    SAVE_DIR = "/content/drive/MyDrive/hotspot_kalteng"
+else:
+    SAVE_DIR = "/content/cache"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+def cached(nama, fn):
+    """Kalau file cache ada -> load; kalau belum -> hitung, simpan, lalu kembalikan."""
+    path = f"{SAVE_DIR}/{nama}.joblib"
+    if os.path.exists(path):
+        print("[cache] load:", nama)
+        return joblib.load(path)
+    hasil = fn()
+    joblib.dump(hasil, path)
+    print("[cache] simpan:", nama)
+    return hasil
+
+# ---------------- baca data ----------------
+df_hotspot = pd.read_csv("/content/drive/MyDrive/Data ML/hotspot_kalimantan_tengah.csv")
+df_meteo   = pd.read_csv("/content/drive/MyDrive/Data ML/meteorologi_kalimantan_tengah.csv")
+batas      = gpd.read_file("/content/drive/MyDrive/Data ML/kalimantan_tengah.geojson")
+print("Ukuran dataset hotspot:", df_hotspot.shape)
+print("Ukuran dataset meteorologi:", df_meteo.shape)
