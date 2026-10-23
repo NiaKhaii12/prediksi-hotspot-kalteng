@@ -181,3 +181,37 @@ def latih(X, y, skenario="tanpa"):
 def proba_ens(rf, xgb, X, w=0.5):
     return w * rf.predict_proba(X)[:, 1] + (1 - w) * xgb.predict_proba(X)[:, 1]
 
+from scipy.stats import loguniform
+
+def tambah_fitur_met(m):
+    m = m.sort_values(["lokasi", "tanggal"]).copy()
+    es = 0.6108 * np.exp(17.27 * m["T2M"] / (m["T2M"] + 237.3))     # tekanan uap jenuh (kPa)
+    m["VPD"] = es * (1 - m["RH2M"].clip(0, 100) / 100)
+    g = m.groupby("lokasi")
+    m["VPD_7d"] = g["VPD"].transform(lambda s: s.rolling(7, min_periods=1).mean())
+    m["CH_30d"] = g["PRECTOTCORR"].transform(lambda s: s.rolling(30, min_periods=1).sum())
+    m["CH_60d"] = g["PRECTOTCORR"].transform(lambda s: s.rolling(60, min_periods=1).sum())
+    m["HKB5"]   = g["PRECTOTCORR"].transform(lambda s: hari_kering_berturut(s, ambang=5.0))
+    return m
+
+met2 = tambah_fitur_met(met)
+
+# ---------- zonasi: HDBSCAN eom + penugasan seragam 5 km ----------
+ZONASI = dict(selection="eom", mcs=150)      # alternatif: dict(selection="leaf")
+R_SERAGAM = 5.0
+
+h = hs[["tanggal", "latitude", "longitude"]].copy()
+mt = (h["tanggal"] <= BATAS_TRAIN).values
+lab_tr, lab_te = zona_seragam(zona_hdbscan, R_SERAGAM)(h, mt, **ZONASI)
+h["zona"] = -1
+h.loc[mt, "zona"] = lab_tr
+h.loc[~mt, "zona"] = lab_te
+
+htr = h.loc[mt]
+htr = htr[htr["zona"] >= 0]
+zi = htr.groupby("zona").agg(lat=("latitude", "mean"), lon=("longitude", "mean"))
+st_rad = np.radians(np.array(list(STASIUN.values())))
+JARAK_ST = haversine_distances(np.radians(zi[["lat", "lon"]].values), st_rad) * 6371   # zona x stasiun
+zi["jarak_stasiun_km"] = JARAK_ST.min(axis=1)
+
+print("Zona:", len(zi), "| cakupan test: %.1f%%" % (100 * (lab_te >= 0).mean()))
