@@ -116,3 +116,68 @@ hs = gdf_hs.loc[dalam].drop(columns="geometry").reset_index(drop=True)
 # ---- cek posisi stasiun terhadap batas provinsi ----
 for nm, (la, lo) in STASIUN.items():
     print(f"{nm:15s} di dalam provinsi: {batas_union.contains(Point(lo, la))}")
+
+MS = 30    # min_samples HDBSCAN
+
+def evaluasi(nama, y, proba, thr=0.5, **extra):
+    pred = (np.asarray(proba) >= thr).astype(int)
+    d = {"Model": nama,
+         "Accuracy":  accuracy_score(y, pred),
+         "Precision": precision_score(y, pred, zero_division=0),
+         "Recall":    recall_score(y, pred, zero_division=0),
+         "F1-score":  f1_score(y, pred, zero_division=0),
+         "ROC-AUC":   roc_auc_score(y, proba),
+         "PR-AUC":    average_precision_score(y, proba)}
+    d.update(extra)
+    return d
+
+def thr_optimal(y, p):
+    prec, rec, thr = precision_recall_curve(y, p)
+    f1s = 2 * prec * rec / (prec + rec + 1e-12)
+    return float(thr[np.argmax(f1s[:-1])])
+
+# ---------- zonasi ----------
+def zona_hdbscan(h, mt, selection="leaf", mcs=150, ms=MS):
+    Xtr = np.radians(h.loc[mt, ["latitude", "longitude"]].values)
+    Xte = np.radians(h.loc[~mt, ["latitude", "longitude"]].values)
+    cl = hdbscan.HDBSCAN(min_cluster_size=mcs, min_samples=ms, metric="haversine",
+                         cluster_selection_method=selection, prediction_data=True).fit(Xtr)
+    lab_te, _ = hdbscan.approximate_predict(cl, Xte)
+    return cl.labels_, lab_te
+
+def zona_seragam(fn_zona, R_km=5.0):
+    """Titik test -> zona training terdekat dalam R km (aturan penugasan yang seragam)."""
+    def f(h, mt, **kw):
+        lab_tr, _ = fn_zona(h, mt, **kw)
+        Xtr = np.radians(h.loc[mt,  ["latitude", "longitude"]].values)
+        Xte = np.radians(h.loc[~mt, ["latitude", "longitude"]].values)
+        ok = lab_tr >= 0
+        d, idx = BallTree(Xtr[ok], metric="haversine").query(Xte, k=1)
+        lab_te = np.where(d[:, 0] * 6371 <= R_km, lab_tr[ok][idx[:, 0]], -1)
+        return lab_tr, lab_te
+    return f
+
+# ---------- parameter awal (hasil tuning v1, supaya tidak perlu mengulang 50 menit) ----------
+RF_PARAMS = {'max_depth': 5, 'max_features': 0.5, 'min_samples_leaf': 3,
+             'min_samples_split': 18, 'n_estimators': 591}
+XGB_PARAMS = {'colsample_bytree': 0.908897907718663, 'gamma': 0.0993578407670862,
+              'learning_rate': 0.011049202253484457, 'max_depth': 5, 'min_child_weight': 3,
+              'n_estimators': 280, 'subsample': 0.88453678109946}
+
+# ---------- model (membaca RF_PARAMS / XGB_PARAMS global saat dipanggil) ----------
+def buat_rf(seed=RS, cw=None):
+    return RandomForestClassifier(**RF_PARAMS, class_weight=cw, random_state=seed, n_jobs=-1)
+
+def buat_xgb(seed=RS, spw=1.0):
+    return XGBClassifier(**XGB_PARAMS, objective="binary:logistic", eval_metric="logloss",
+                         scale_pos_weight=spw, tree_method="hist", random_state=seed, n_jobs=-1)
+
+def latih(X, y, skenario="tanpa"):
+    if skenario == "class_weight":
+        spw = (y == 0).sum() / (y == 1).sum()
+        return buat_rf(cw="balanced_subsample").fit(X, y), buat_xgb(spw=spw).fit(X, y)
+    return buat_rf().fit(X, y), buat_xgb().fit(X, y)
+
+def proba_ens(rf, xgb, X, w=0.5):
+    return w * rf.predict_proba(X)[:, 1] + (1 - w) * xgb.predict_proba(X)[:, 1]
+
