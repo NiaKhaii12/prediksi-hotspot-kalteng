@@ -215,3 +215,54 @@ JARAK_ST = haversine_distances(np.radians(zi[["lat", "lon"]].values), st_rad) * 
 zi["jarak_stasiun_km"] = JARAK_ST.min(axis=1)
 
 print("Zona:", len(zi), "| cakupan test: %.1f%%" % (100 * (lab_te >= 0).mean()))
+
+nama_st = list(STASIUN)
+zi["stasiun"] = [nama_st[i] for i in JARAK_ST.argmin(axis=1)]
+warna_st = dict(zip(nama_st, plt.cm.Set1.colors[:len(nama_st)]))
+
+def dasar(ax, judul):
+    batas.boundary.plot(ax=ax, color="k", linewidth=0.8)
+    ax.set_title(judul, fontsize=10)
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+
+# ---------- Peta 1: penyebaran hotspot per tahun ----------
+tahun = sorted(hs["tanggal"].dt.year.unique())
+fig, axes = plt.subplots(2, 3, figsize=(15, 9), sharex=True, sharey=True)
+for ax, th in zip(axes.ravel(), tahun):
+    d = hs[hs["tanggal"].dt.year == th]
+    batas.boundary.plot(ax=ax, color="k", linewidth=0.6)
+    ax.scatter(d["longitude"], d["latitude"], s=0.3, alpha=0.25, c="tab:red")
+    ax.set_title(f"{th}  (n = {len(d):,})", fontsize=10)
+plt.suptitle("Sebaran hotspot VIIRS di Kalimantan Tengah per tahun", y=1.0)
+plt.tight_layout()
+plt.savefig(f"{SAVE_DIR}/peta_hotspot_tahunan.png", dpi=200, bbox_inches="tight")
+plt.show()
+
+# ---------- Peta 2: zona HDBSCAN + stasiun + garis ke stasiun dominan ----------
+fig, ax = plt.subplots(figsize=(9, 8))
+dasar(ax, f"Zona HDBSCAN ({len(zi)} zona, data training) dan stasiun meteorologi")
+ns = h[mt & (h["zona"] == -1).values]
+dz = h[mt & (h["zona"] >= 0).values]
+ax.scatter(ns["longitude"], ns["latitude"], s=0.3, c="lightgrey", label="noise")
+ax.scatter(dz["longitude"], dz["latitude"], s=0.5,
+           c=[warna_st[s] for s in dz["zona"].map(zi["stasiun"])])
+for z, r in zi.iterrows():
+    la, lo = STASIUN[r["stasiun"]]
+    ax.plot([r["lon"], lo], [r["lat"], la], color=warna_st[r["stasiun"]], lw=0.6, alpha=0.6)
+ax.scatter(zi["lon"], zi["lat"], s=6, c="k", zorder=4)
+for nm, (la, lo) in STASIUN.items():
+    ax.scatter(lo, la, marker="^", s=170, c=[warna_st[nm]], edgecolor="k", zorder=5)
+    ax.text(lo + 0.06, la + 0.06, nm, fontsize=9, weight="bold")
+plt.savefig(f"{SAVE_DIR}/peta_zona_stasiun.png", dpi=200, bbox_inches="tight")
+plt.show()
+
+# ---------- Peta 3: cakupan zona pada data test (titik di dalam zona vs noise) ----------
+ht = h[~mt]
+fig, ax = plt.subplots(figsize=(9, 8))
+dasar(ax, "Cakupan zona pada hotspot 2025–2026")
+a = ht[ht["zona"] == -1]; b = ht[ht["zona"] >= 0]
+ax.scatter(a["longitude"], a["latitude"], s=0.3, alpha=0.3, c="tab:red", label=f"luar zona ({100*len(a)/len(ht):.0f}%)")
+ax.scatter(b["longitude"], b["latitude"], s=0.3, alpha=0.3, c="tab:blue", label=f"dalam zona ({100*len(b)/len(ht):.0f}%)")
+ax.legend(markerscale=15)
+plt.savefig(f"{SAVE_DIR}/peta_cakupan_test.png", dpi=200, bbox_inches="tight")
+plt.show()
